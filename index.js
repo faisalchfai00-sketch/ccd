@@ -6,6 +6,7 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
 const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 require('dotenv').config();
 
 // ==================== FIREBASE ADMIN INIT ====================
@@ -138,7 +139,6 @@ app.post('/api/login', async (req, res) => {
       return res.status(500).json({ error: 'Firebase API key missing' });
     }
 
-    const fetch = require('node-fetch');
     const verifyResponse = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
       {
@@ -173,35 +173,42 @@ app.post('/api/login', async (req, res) => {
 
     // Get user data from Firestore
     console.log('Fetching user data from Firestore...');
-    const userDoc = await db.collection('users').doc(userRecord.uid).get();
     let userData = {};
     
-    if (userDoc.exists) {
-      userData = userDoc.data();
-      console.log('User data found in Firestore');
-    } else {
-      // Create default user data
-      console.log('Creating default user data');
-      const defaultData = {
-        settings: {
-          refNo: '1/DO CCD',
-          centerDo: 'PAKPATTAN',
-          toDate: '01/01/2026',
-          dateAfterTrack: '01/09/2025',
-          fir: 'FIR-1112/24',
-          us: '395/412',
-          ps: 'Saddar Arifwala',
-          io: 'ASI Muhammad Naeem',
-          ioNo: '0300-9793362',
-          divisionRo: 'SAHIWAL',
-          divRef: '3097',
-          divDate: '30/11/2025',
-          refDate: '30/11/2025'
-        }
-      };
-      await db.collection('users').doc(userRecord.uid).set(defaultData);
-      userData = defaultData;
-      console.log('Default user data created');
+    try {
+      const userDoc = await db.collection('users').doc(userRecord.uid).get();
+      
+      if (userDoc.exists) {
+        userData = userDoc.data();
+        console.log('User data found in Firestore');
+      } else {
+        // Create default user data
+        console.log('Creating default user data');
+        const defaultData = {
+          settings: {
+            refNo: '1/DO CCD',
+            centerDo: 'PAKPATTAN',
+            toDate: '01/01/2026',
+            dateAfterTrack: '01/09/2025',
+            fir: 'FIR-1112/24',
+            us: '395/412',
+            ps: 'Saddar Arifwala',
+            io: 'ASI Muhammad Naeem',
+            ioNo: '0300-9793362',
+            divisionRo: 'SAHIWAL',
+            divRef: '3097',
+            divDate: '30/11/2025',
+            refDate: '30/11/2025'
+          }
+        };
+        await db.collection('users').doc(userRecord.uid).set(defaultData);
+        userData = defaultData;
+        console.log('Default user data created');
+      }
+    } catch (firestoreError) {
+      console.error('Firestore error:', firestoreError);
+      // Continue with empty user data
+      userData = { settings: {} };
     }
 
     console.log('Login successful for:', email);
@@ -304,6 +311,9 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
       await statsRef.set({
         cdrs: category === 'cdrs' ? count : 0,
         imei: category === 'imei' ? count : 0,
+        location: category === 'location' ? count : 0,
+        subinfo: category === 'subinfo' ? count : 0,
+        cnic: category === 'get-cnic' ? count : 0,
         total: count
       });
     } else {
@@ -347,12 +357,18 @@ app.get('/api/history', authenticateToken, async (req, res) => {
 
     console.log('Fetching history for uid:', uid, 'category:', category);
 
+    // Check if db is initialized
+    if (!db) {
+      console.error('Firestore not initialized');
+      return res.status(500).json({ error: 'Database not initialized' });
+    }
+
     let query = db.collection('history')
       .where('userId', '==', uid)
       .orderBy('createdAt', 'desc')
       .limit(parseInt(limit));
 
-    if (category) {
+    if (category && category !== '') {
       query = query.where('category', '==', category);
     }
 
@@ -360,18 +376,24 @@ app.get('/api/history', authenticateToken, async (req, res) => {
     
     const history = [];
     snapshot.forEach(doc => {
+      const data = doc.data();
       history.push({
         id: doc.id,
-        ...doc.data(),
-        createdAt: doc.data().createdAt?.toDate() || null
+        ...data,
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : null
       });
     });
 
     console.log('Found', history.length, 'history entries');
     res.json(history);
   } catch (error) {
-    console.error('Get history error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('💥 Get history error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
