@@ -10,23 +10,47 @@ require('dotenv').config();
 
 // ==================== FIREBASE ADMIN INIT ====================
 let firebaseInitialized = false;
+let db = null;
+
 try {
+  console.log('🔥 Starting Firebase Admin initialization...');
+  console.log('Project ID exists:', !!process.env.FIREBASE_PROJECT_ID);
+  console.log('Private Key exists:', !!process.env.FIREBASE_PRIVATE_KEY);
+  console.log('Client Email exists:', !!process.env.FIREBASE_CLIENT_EMAIL);
+
   if (!admin.apps.length) {
+    // Format private key correctly
+    let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+    if (privateKey) {
+      // Handle both formats: with \n and actual line breaks
+      privateKey = privateKey.replace(/\\n/g, '\n');
+      console.log('Private key formatted, length:', privateKey.length);
+    }
+
+    const credential = {
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      privateKey: privateKey,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    };
+
+    console.log('Credential object created');
+
     admin.initializeApp({
-      credential: admin.credential.cert({
-        projectId: process.env.FIREBASE_PROJECT_ID,
-        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      }),
+      credential: admin.credential.cert(credential),
     });
+
+    db = admin.firestore();
     firebaseInitialized = true;
-    console.log('✅ Firebase Admin initialized');
+    console.log('✅ Firebase Admin initialized successfully');
   }
 } catch (error) {
   console.error('❌ Firebase Admin init error:', error);
+  console.error('Error details:', {
+    message: error.message,
+    code: error.code,
+    stack: error.stack
+  });
 }
-
-const db = admin.firestore();
 
 // ==================== EXPRESS SETUP ====================
 const app = express();
@@ -43,6 +67,12 @@ app.use(
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
   })
 );
+
+// Log all requests for debugging
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
 
 // ==================== AUTH MIDDLEWARE ====================
 const authenticateToken = (req, res, next) => {
@@ -68,41 +98,47 @@ const authenticateToken = (req, res, next) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: '🟢 Suspect Tracker API Running',
-    firebase: firebaseInitialized ? '✅ connected' : '❌ not connected'
+    firebase: firebaseInitialized ? '✅ connected' : '❌ not connected',
+    timestamp: new Date().toISOString()
   });
 });
 
 // ==================== 1. LOGIN ====================
 app.post('/api/login', async (req, res) => {
+  console.log('📝 Login endpoint hit');
+  
   try {
     const { email, password } = req.body;
+    console.log('Email:', email);
+    console.log('Password provided:', !!password);
 
     if (!email || !password) {
+      console.log('Missing email or password');
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    // Firebase Auth se verify
+    // Check Firebase Auth
+    console.log('Checking Firebase Auth for user...');
     let userRecord;
     try {
       userRecord = await admin.auth().getUserByEmail(email);
-    } catch (error) {
+      console.log('User found in Firebase Auth:', userRecord.uid);
+    } catch (authError) {
+      console.error('Firebase Auth error:', authError);
       return res.status(401).json({ error: 'User not found' });
     }
 
-    // Firebase Admin SDK direct password verify nahi kar sakta
-    // Isliye hum user exists check kar rahe hain
-    // Actual password verification frontend Firebase SDK se hogi ya Firebase REST API se
-    // Lekin tere requirement ke mutabiq frontend mein Firebase nahi chahiye
-    // So we'll use Firebase REST API for password verification
-
-    // Option 2: Firebase REST API se verify karo
-    const fetch = require('node-fetch');
-    const apiKey = process.env.FIREBASE_API_KEY; // Add this in .env
+    // Verify password using Firebase REST API
+    console.log('Verifying password with Firebase REST API...');
+    const apiKey = process.env.FIREBASE_API_KEY;
+    console.log('API Key exists:', !!apiKey);
     
     if (!apiKey) {
+      console.error('FIREBASE_API_KEY missing in environment');
       return res.status(500).json({ error: 'Firebase API key missing' });
     }
 
+    const fetch = require('node-fetch');
     const verifyResponse = await fetch(
       `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
       {
@@ -113,12 +149,16 @@ app.post('/api/login', async (req, res) => {
     );
 
     const verifyData = await verifyResponse.json();
+    console.log('Firebase REST API response status:', verifyResponse.status);
 
     if (!verifyResponse.ok) {
+      console.error('Password verification failed:', verifyData.error);
       return res.status(401).json({ error: verifyData.error?.message || 'Invalid password' });
     }
 
-    // User verified, generate JWT token
+    console.log('Password verified successfully');
+
+    // Generate JWT token
     const token = jwt.sign(
       { 
         uid: userRecord.uid, 
@@ -129,13 +169,19 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // Also get user data from Firestore
+    console.log('JWT token generated');
+
+    // Get user data from Firestore
+    console.log('Fetching user data from Firestore...');
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
     let userData = {};
+    
     if (userDoc.exists) {
       userData = userDoc.data();
+      console.log('User data found in Firestore');
     } else {
       // Create default user data
+      console.log('Creating default user data');
       const defaultData = {
         settings: {
           refNo: '1/DO CCD',
@@ -155,8 +201,10 @@ app.post('/api/login', async (req, res) => {
       };
       await db.collection('users').doc(userRecord.uid).set(defaultData);
       userData = defaultData;
+      console.log('Default user data created');
     }
 
+    console.log('Login successful for:', email);
     res.json({
       token,
       user: {
@@ -167,8 +215,13 @@ app.post('/api/login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('💥 Login error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -176,12 +229,16 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/user-data', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
+    console.log('Fetching user data for uid:', uid);
+    
     const userDoc = await db.collection('users').doc(uid).get();
 
     if (!userDoc.exists) {
+      console.log('User data not found');
       return res.status(404).json({ error: 'User data not found' });
     }
 
+    console.log('User data fetched successfully');
     res.json(userDoc.data());
   } catch (error) {
     console.error('Get user data error:', error);
@@ -195,15 +252,16 @@ app.post('/api/save-settings', authenticateToken, async (req, res) => {
     const uid = req.user.uid;
     const settings = req.body;
 
-    // Validate settings (optional)
     if (!settings) {
       return res.status(400).json({ error: 'Settings required' });
     }
 
+    console.log('Saving settings for uid:', uid);
     await db.collection('users').doc(uid).set({
       settings: settings
     }, { merge: true });
 
+    console.log('Settings saved successfully');
     res.json({ success: true, message: 'Settings saved successfully' });
   } catch (error) {
     console.error('Save settings error:', error);
@@ -221,6 +279,7 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Category and outputData required' });
     }
 
+    console.log('Saving output to history for uid:', uid);
     const historyEntry = {
       userId: uid,
       category,
@@ -255,6 +314,12 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
         update.cdrs = (stats.cdrs || 0) + count;
       } else if (category === 'imei') {
         update.imei = (stats.imei || 0) + count;
+      } else if (category === 'location') {
+        update.location = (stats.location || 0) + count;
+      } else if (category === 'subinfo') {
+        update.subinfo = (stats.subinfo || 0) + count;
+      } else if (category === 'get-cnic') {
+        update.cnic = (stats.cnic || 0) + count;
       }
       
       update.total = (stats.total || 0) + count;
@@ -262,6 +327,7 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
       await statsRef.update(update);
     }
 
+    console.log('Output saved to history with id:', docRef.id);
     res.json({ 
       success: true, 
       id: docRef.id,
@@ -278,6 +344,8 @@ app.get('/api/history', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const { category, limit = 50 } = req.query;
+
+    console.log('Fetching history for uid:', uid, 'category:', category);
 
     let query = db.collection('history')
       .where('userId', '==', uid)
@@ -299,6 +367,7 @@ app.get('/api/history', authenticateToken, async (req, res) => {
       });
     });
 
+    console.log('Found', history.length, 'history entries');
     res.json(history);
   } catch (error) {
     console.error('Get history error:', error);
@@ -310,12 +379,16 @@ app.get('/api/history', authenticateToken, async (req, res) => {
 app.get('/api/stats', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
+    console.log('Fetching stats for uid:', uid);
+    
     const statsDoc = await db.collection('stats').doc(uid).get();
 
     if (!statsDoc.exists) {
-      return res.json({ cdrs: 0, imei: 0, total: 0 });
+      console.log('No stats found, returning zeros');
+      return res.json({ cdrs: 0, imei: 0, location: 0, subinfo: 0, cnic: 0, total: 0 });
     }
 
+    console.log('Stats found');
     res.json(statsDoc.data());
   } catch (error) {
     console.error('Get stats error:', error);
@@ -328,6 +401,8 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const historyId = req.params.id;
+
+    console.log('Deleting history entry:', historyId, 'for uid:', uid);
 
     const historyRef = db.collection('history').doc(historyId);
     const historyDoc = await historyRef.get();
@@ -354,6 +429,12 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
         update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
       } else if (historyData.category === 'imei') {
         update.imei = Math.max(0, (stats.imei || 0) - count);
+      } else if (historyData.category === 'location') {
+        update.location = Math.max(0, (stats.location || 0) - count);
+      } else if (historyData.category === 'subinfo') {
+        update.subinfo = Math.max(0, (stats.subinfo || 0) - count);
+      } else if (historyData.category === 'get-cnic') {
+        update.cnic = Math.max(0, (stats.cnic || 0) - count);
       }
       
       update.total = Math.max(0, (stats.total || 0) - count);
@@ -363,6 +444,7 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
 
     await historyRef.delete();
 
+    console.log('History entry deleted successfully');
     res.json({ success: true, message: 'History entry deleted' });
   } catch (error) {
     console.error('Delete history error:', error);
@@ -372,6 +454,7 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
 
 // ==================== 8. VERIFY TOKEN ====================
 app.post('/api/verify-token', authenticateToken, (req, res) => {
+  console.log('Token verified for uid:', req.user.uid);
   res.json({ 
     valid: true, 
     user: {
@@ -382,15 +465,16 @@ app.post('/api/verify-token', authenticateToken, (req, res) => {
 });
 
 // ==================== 9. ADMIN: CREATE USER (Manual) ====================
-// Yeh route admin ke liye hai, isko protect karo apne tarike se
 app.post('/api/admin/create-user', async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
-    // Simple secret check - change this
-    if (adminSecret !== 'your-admin-secret-123') {
+    if (adminSecret !== process.env.ADMIN_SECRET) {
+      console.log('Admin create user: unauthorized attempt');
       return res.status(403).json({ error: 'Unauthorized' });
     }
+
+    console.log('Creating new user:', email);
 
     const userRecord = await admin.auth().createUser({
       email,
@@ -416,6 +500,7 @@ app.post('/api/admin/create-user', async (req, res) => {
       }
     });
 
+    console.log('User created successfully:', userRecord.uid);
     res.json({ 
       success: true, 
       uid: userRecord.uid,
@@ -432,10 +517,12 @@ app.post('/api/admin/delete-user', async (req, res) => {
   try {
     const { email, adminSecret } = req.body;
     
-    if (adminSecret !== 'your-admin-secret-123') {
+    if (adminSecret !== process.env.ADMIN_SECRET) {
+      console.log('Admin delete user: unauthorized attempt');
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
+    console.log('Deleting user:', email);
     const userRecord = await admin.auth().getUserByEmail(email);
     
     // Delete user data from Firestore
@@ -458,6 +545,7 @@ app.post('/api/admin/delete-user', async (req, res) => {
     // Delete from Auth
     await admin.auth().deleteUser(userRecord.uid);
 
+    console.log('User deleted completely:', userRecord.uid);
     res.json({ success: true, message: 'User deleted completely' });
   } catch (error) {
     console.error('Delete user error:', error);
@@ -468,6 +556,8 @@ app.post('/api/admin/delete-user', async (req, res) => {
 // ==================== START SERVER ====================
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🔥 Firebase initialized: ${firebaseInitialized}`);
+  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 // Export for Vercel
