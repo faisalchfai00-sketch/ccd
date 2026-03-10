@@ -1,7 +1,7 @@
 {
   "name": "suspect-tracker-backend",
   "version": "1.0.0",
-  "description": "Backend for Suspect Tracker - CDRS, IMEI, Location, SUB INFO, GET CNIC",
+  "description": "Backend for Suspect Tracker",
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js",
@@ -15,8 +15,5 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
