@@ -1,7 +1,7 @@
 {
   "name": "suspect-tracker-backend",
   "version": "1.0.0",
-  "description": "Backend for Suspect Tracker",
+  "description": "Backend for Suspect Tracker - CDRS, IMEI, Location, SUB INFO, GET CNIC",
   "main": "api/index.js",
   "scripts": {
     "start": "node api/index.js",
@@ -11,11 +11,12 @@
     "express": "^4.18.2",
     "firebase-admin": "^11.11.0",
     "cors": "^2.8.5",
-    "bcryptjs": "^2.4.3",
-    "jsonwebtoken": "^9.0.2",
     "dotenv": "^16.3.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
