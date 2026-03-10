@@ -1,24 +1,14 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/index.js",
-      "use": "@vercel/node"
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 10
     }
-  ],
+  },
   "routes": [
     {
-      "src": "/(.*)",
-      "dest": "api/index.js"
+      "src": "/api/(.*)",
+      "dest": "/api/index.js"
     }
-  ],
-  "env": {
-    "FIREBASE_PROJECT_ID": "@firebase-project-id",
-    "FIREBASE_PRIVATE_KEY_ID": "@firebase-private-key-id",
-    "FIREBASE_PRIVATE_KEY": "@firebase-private-key",
-    "FIREBASE_CLIENT_EMAIL": "@firebase-client-email",
-    "FIREBASE_CLIENT_ID": "@firebase-client-id",
-    "FIREBASE_CLIENT_CERT_URL": "@firebase-client-cert-url",
-    "FIREBASE_DATABASE_URL": "@firebase-database-url"
-  }
+  ]
 }
