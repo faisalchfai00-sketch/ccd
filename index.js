@@ -301,38 +301,41 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
 
     const docRef = await db.collection('history').add(historyEntry);
 
-    // Update stats
+    // Update stats - ONLY FOR CDRS AND IMEI
+    // Location, SubInfo, GET CNIC are NOT counted in dashboard stats
     const statsRef = db.collection('stats').doc(uid);
     const statsDoc = await statsRef.get();
     
     const count = Array.isArray(numbers) ? numbers.length : 1;
     
     if (!statsDoc.exists) {
+      // Initialize stats with zeros
       await statsRef.set({
         cdrs: category === 'cdrs' ? count : 0,
         imei: category === 'imei' ? count : 0,
-        location: category === 'location' ? count : 0,
-        subinfo: category === 'subinfo' ? count : 0,
-        cnic: category === 'get-cnic' ? count : 0,
-        total: count
+        total: (category === 'cdrs' || category === 'imei') ? count : 0
       });
     } else {
       const stats = statsDoc.data();
       const update = {};
       
+      // Only update cdrs and imei counts
       if (category === 'cdrs') {
         update.cdrs = (stats.cdrs || 0) + count;
+        update.total = (stats.total || 0) + count;
       } else if (category === 'imei') {
         update.imei = (stats.imei || 0) + count;
-      } else if (category === 'location') {
-        update.location = (stats.location || 0) + count;
-      } else if (category === 'subinfo') {
-        update.subinfo = (stats.subinfo || 0) + count;
-      } else if (category === 'get-cnic') {
-        update.cnic = (stats.cnic || 0) + count;
+        update.total = (stats.total || 0) + count;
+      } else {
+        // For other categories (location, subinfo, get-cnic) - don't update stats
+        // Just return without updating stats
+        console.log('Category not counted in stats:', category);
+        return res.json({ 
+          success: true, 
+          id: docRef.id,
+          message: 'Output saved to history (not counted in stats)' 
+        });
       }
-      
-      update.total = (stats.total || 0) + count;
       
       await statsRef.update(update);
     }
@@ -397,7 +400,7 @@ app.get('/api/history', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== 6. GET STATS ====================
+// ==================== 6. GET STATS (ONLY CDRS & IMEI) ====================
 app.get('/api/stats', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -407,11 +410,18 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 
     if (!statsDoc.exists) {
       console.log('No stats found, returning zeros');
-      return res.json({ cdrs: 0, imei: 0, location: 0, subinfo: 0, cnic: 0, total: 0 });
+      return res.json({ cdrs: 0, imei: 0, total: 0 });
     }
 
-    console.log('Stats found');
-    res.json(statsDoc.data());
+    const stats = statsDoc.data();
+    console.log('Stats found:', stats);
+    
+    // Return only cdrs, imei, and total
+    res.json({
+      cdrs: stats.cdrs || 0,
+      imei: stats.imei || 0,
+      total: stats.total || 0
+    });
   } catch (error) {
     console.error('Get stats error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -438,7 +448,7 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
-    // Update stats before deleting
+    // Update stats before deleting (only for cdrs and imei)
     const statsRef = db.collection('stats').doc(uid);
     const statsDoc = await statsRef.get();
     
@@ -449,17 +459,12 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
       
       if (historyData.category === 'cdrs') {
         update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
+        update.total = Math.max(0, (stats.total || 0) - count);
       } else if (historyData.category === 'imei') {
         update.imei = Math.max(0, (stats.imei || 0) - count);
-      } else if (historyData.category === 'location') {
-        update.location = Math.max(0, (stats.location || 0) - count);
-      } else if (historyData.category === 'subinfo') {
-        update.subinfo = Math.max(0, (stats.subinfo || 0) - count);
-      } else if (historyData.category === 'get-cnic') {
-        update.cnic = Math.max(0, (stats.cnic || 0) - count);
+        update.total = Math.max(0, (stats.total || 0) - count);
       }
-      
-      update.total = Math.max(0, (stats.total || 0) - count);
+      // For other categories, don't update stats
       
       await statsRef.update(update);
     }
