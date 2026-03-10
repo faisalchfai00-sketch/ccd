@@ -89,9 +89,15 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    // Firebase REST API for password verification
+    // Firebase Admin SDK direct password verify nahi kar sakta
+    // Isliye hum user exists check kar rahe hain
+    // Actual password verification frontend Firebase SDK se hogi ya Firebase REST API se
+    // Lekin tere requirement ke mutabiq frontend mein Firebase nahi chahiye
+    // So we'll use Firebase REST API for password verification
+
+    // Option 2: Firebase REST API se verify karo
     const fetch = require('node-fetch');
-    const apiKey = process.env.FIREBASE_API_KEY;
+    const apiKey = process.env.FIREBASE_API_KEY; // Add this in .env
     
     if (!apiKey) {
       return res.status(500).json({ error: 'Firebase API key missing' });
@@ -189,6 +195,7 @@ app.post('/api/save-settings', authenticateToken, async (req, res) => {
     const uid = req.user.uid;
     const settings = req.body;
 
+    // Validate settings (optional)
     if (!settings) {
       return res.status(400).json({ error: 'Settings required' });
     }
@@ -248,13 +255,6 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
         update.cdrs = (stats.cdrs || 0) + count;
       } else if (category === 'imei') {
         update.imei = (stats.imei || 0) + count;
-      } else if (category === 'location') {
-        // Location category bhi count karo
-        update.location = (stats.location || 0) + count;
-      } else if (category === 'subinfo') {
-        update.subinfo = (stats.subinfo || 0) + count;
-      } else if (category === 'get-cnic') {
-        update.getcnic = (stats.getcnic || 0) + count;
       }
       
       update.total = (stats.total || 0) + count;
@@ -273,16 +273,16 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== 5. GET HISTORY (FIXED - ORDERBY REMOVED) ====================
+// ==================== 5. GET HISTORY ====================
 app.get('/api/history', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const { category, limit = 50 } = req.query;
 
-    // 👇 FIX: orderBy temporarily removed to avoid index error
     let query = db.collection('history')
-      .where('userId', '==', uid);
-      // .orderBy('createdAt', 'desc')   // ← Commented out to fix 500 error
+      .where('userId', '==', uid)
+      .orderBy('createdAt', 'desc')
+      .limit(parseInt(limit));
 
     if (category) {
       query = query.where('category', '==', category);
@@ -299,17 +299,7 @@ app.get('/api/history', authenticateToken, async (req, res) => {
       });
     });
 
-    // Sort manually by createdAt (descending)
-    history.sort((a, b) => {
-      if (!a.createdAt) return 1;
-      if (!b.createdAt) return -1;
-      return b.createdAt - a.createdAt;
-    });
-
-    // Apply limit after sorting
-    const limitedHistory = history.slice(0, parseInt(limit));
-
-    res.json(limitedHistory);
+    res.json(history);
   } catch (error) {
     console.error('Get history error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -323,7 +313,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
     const statsDoc = await db.collection('stats').doc(uid).get();
 
     if (!statsDoc.exists) {
-      return res.json({ cdrs: 0, imei: 0, location: 0, subinfo: 0, getcnic: 0, total: 0 });
+      return res.json({ cdrs: 0, imei: 0, total: 0 });
     }
 
     res.json(statsDoc.data());
@@ -364,12 +354,6 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
         update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
       } else if (historyData.category === 'imei') {
         update.imei = Math.max(0, (stats.imei || 0) - count);
-      } else if (historyData.category === 'location') {
-        update.location = Math.max(0, (stats.location || 0) - count);
-      } else if (historyData.category === 'subinfo') {
-        update.subinfo = Math.max(0, (stats.subinfo || 0) - count);
-      } else if (historyData.category === 'get-cnic') {
-        update.getcnic = Math.max(0, (stats.getcnic || 0) - count);
       }
       
       update.total = Math.max(0, (stats.total || 0) - count);
@@ -398,10 +382,12 @@ app.post('/api/verify-token', authenticateToken, (req, res) => {
 });
 
 // ==================== 9. ADMIN: CREATE USER (Manual) ====================
+// Yeh route admin ke liye hai, isko protect karo apne tarike se
 app.post('/api/admin/create-user', async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
+    // Simple secret check - change this
     if (adminSecret !== 'your-admin-secret-123') {
       return res.status(403).json({ error: 'Unauthorized' });
     }
