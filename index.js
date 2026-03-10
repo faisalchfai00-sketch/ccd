@@ -8,6 +8,19 @@ const jwt = require('jsonwebtoken');
 const admin = require('firebase-admin');
 require('dotenv').config();
 
+// ==================== FIX FOR node-fetch (CommonJS compatibility) ====================
+// Yeh dono tarah se kaam karega - node-fetch v2 aur v3 ke saath
+let fetch;
+(async () => {
+  try {
+    // Pehle v2 try karo
+    fetch = require('node-fetch');
+  } catch (e) {
+    // Agar v2 nahi hai to v3 dynamic import karo
+    fetch = (await import('node-fetch')).default;
+  }
+})();
+
 // ==================== FIREBASE ADMIN INIT ====================
 let firebaseInitialized = false;
 try {
@@ -38,7 +51,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5500',
+    origin: process.env.FRONTEND_URL || 'https://suspect-tracker.free.nf',
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
   })
@@ -72,7 +85,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ==================== 1. LOGIN ====================
+// ==================== 1. LOGIN (FIXED) ====================
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -89,11 +102,15 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    const fetch = require('node-fetch');
     const apiKey = process.env.FIREBASE_API_KEY;
     
     if (!apiKey) {
       return res.status(500).json({ error: 'Firebase API key missing' });
+    }
+
+    // fetch available hone tak wait karo
+    if (!fetch) {
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     const verifyResponse = await fetch(
@@ -122,7 +139,7 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // Also get user data from Firestore
+    // Get user data from Firestore
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
     let userData = {};
     if (userDoc.exists) {
@@ -271,7 +288,7 @@ app.get('/api/history', authenticateToken, async (req, res) => {
     const uid = req.user.uid;
     const { category, limit = 50 } = req.query;
 
-    // FIX: Without orderBy to avoid index error
+    // Without orderBy to avoid index error
     let query = db.collection('history').where('userId', '==', uid);
     
     if (category) {
