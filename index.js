@@ -89,15 +89,8 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    // Firebase Admin SDK direct password verify nahi kar sakta
-    // Isliye hum user exists check kar rahe hain
-    // Actual password verification frontend Firebase SDK se hogi ya Firebase REST API se
-    // Lekin tere requirement ke mutabiq frontend mein Firebase nahi chahiye
-    // So we'll use Firebase REST API for password verification
-
-    // Option 2: Firebase REST API se verify karo
     const fetch = require('node-fetch');
-    const apiKey = process.env.FIREBASE_API_KEY; // Add this in .env
+    const apiKey = process.env.FIREBASE_API_KEY;
     
     if (!apiKey) {
       return res.status(500).json({ error: 'Firebase API key missing' });
@@ -195,7 +188,6 @@ app.post('/api/save-settings', authenticateToken, async (req, res) => {
     const uid = req.user.uid;
     const settings = req.body;
 
-    // Validate settings (optional)
     if (!settings) {
       return res.status(400).json({ error: 'Settings required' });
     }
@@ -273,24 +265,23 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== 5. GET HISTORY ====================
+// ==================== 5. GET HISTORY (FIXED) ====================
 app.get('/api/history', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const { category, limit = 50 } = req.query;
 
-    let query = db.collection('history')
-      .where('userId', '==', uid)
-      .orderBy('createdAt', 'desc')
-      .limit(parseInt(limit));
-
+    // FIX: Without orderBy to avoid index error
+    let query = db.collection('history').where('userId', '==', uid);
+    
     if (category) {
       query = query.where('category', '==', category);
     }
 
     const snapshot = await query.get();
     
-    const history = [];
+    // Manually sort by createdAt (descending)
+    let history = [];
     snapshot.forEach(doc => {
       history.push({
         id: doc.id,
@@ -298,6 +289,16 @@ app.get('/api/history', authenticateToken, async (req, res) => {
         createdAt: doc.data().createdAt?.toDate() || null
       });
     });
+    
+    // Sort by date (newest first)
+    history.sort((a, b) => {
+      if (!a.createdAt) return 1;
+      if (!b.createdAt) return -1;
+      return b.createdAt - a.createdAt;
+    });
+    
+    // Apply limit after sorting
+    history = history.slice(0, parseInt(limit));
 
     res.json(history);
   } catch (error) {
@@ -382,12 +383,10 @@ app.post('/api/verify-token', authenticateToken, (req, res) => {
 });
 
 // ==================== 9. ADMIN: CREATE USER (Manual) ====================
-// Yeh route admin ke liye hai, isko protect karo apne tarike se
 app.post('/api/admin/create-user', async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
-    // Simple secret check - change this
     if (adminSecret !== 'your-admin-secret-123') {
       return res.status(403).json({ error: 'Unauthorized' });
     }
@@ -397,7 +396,6 @@ app.post('/api/admin/create-user', async (req, res) => {
       password,
     });
 
-    // Create default user data
     await db.collection('users').doc(userRecord.uid).set({
       settings: {
         refNo: '1/DO CCD',
@@ -438,13 +436,9 @@ app.post('/api/admin/delete-user', async (req, res) => {
 
     const userRecord = await admin.auth().getUserByEmail(email);
     
-    // Delete user data from Firestore
     await db.collection('users').doc(userRecord.uid).delete();
-    
-    // Delete stats
     await db.collection('stats').doc(userRecord.uid).delete();
     
-    // Delete history (batched)
     const historySnapshot = await db.collection('history')
       .where('userId', '==', userRecord.uid)
       .get();
@@ -455,7 +449,6 @@ app.post('/api/admin/delete-user', async (req, res) => {
     });
     await batch.commit();
 
-    // Delete from Auth
     await admin.auth().deleteUser(userRecord.uid);
 
     res.json({ success: true, message: 'User deleted completely' });
