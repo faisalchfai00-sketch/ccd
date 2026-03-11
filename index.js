@@ -302,7 +302,6 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
     const docRef = await db.collection('history').add(historyEntry);
 
     // Update stats - ONLY FOR CDRS AND IMEI
-    // Location, SubInfo, GET CNIC are NOT counted in dashboard stats
     const statsRef = db.collection('stats').doc(uid);
     const statsDoc = await statsRef.get();
     
@@ -323,21 +322,15 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
       if (category === 'cdrs') {
         update.cdrs = (stats.cdrs || 0) + count;
         update.total = (stats.total || 0) + count;
+        await statsRef.update(update);
       } else if (category === 'imei') {
         update.imei = (stats.imei || 0) + count;
         update.total = (stats.total || 0) + count;
+        await statsRef.update(update);
       } else {
         // For other categories (location, subinfo, get-cnic) - don't update stats
-        // Just return without updating stats
         console.log('Category not counted in stats:', category);
-        return res.json({ 
-          success: true, 
-          id: docRef.id,
-          message: 'Output saved to history (not counted in stats)' 
-        });
       }
-      
-      await statsRef.update(update);
     }
 
     console.log('Output saved to history with id:', docRef.id);
@@ -428,7 +421,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
   }
 });
 
-// ==================== 7. DELETE HISTORY ENTRY ====================
+// ==================== 7. DELETE HISTORY ENTRY (FIXED) ====================
 app.delete('/api/history/:id', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -449,33 +442,45 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
     }
 
     // Update stats before deleting (only for cdrs and imei)
-    const statsRef = db.collection('stats').doc(uid);
-    const statsDoc = await statsRef.get();
-    
-    if (statsDoc.exists) {
-      const stats = statsDoc.data();
-      const count = Array.isArray(historyData.numbers) ? historyData.numbers.length : 1;
-      const update = {};
+    try {
+      const statsRef = db.collection('stats').doc(uid);
+      const statsDoc = await statsRef.get();
       
-      if (historyData.category === 'cdrs') {
-        update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
-        update.total = Math.max(0, (stats.total || 0) - count);
-      } else if (historyData.category === 'imei') {
-        update.imei = Math.max(0, (stats.imei || 0) - count);
-        update.total = Math.max(0, (stats.total || 0) - count);
+      if (statsDoc.exists) {
+        const stats = statsDoc.data();
+        const count = Array.isArray(historyData.numbers) ? historyData.numbers.length : 1;
+        const update = {};
+        
+        if (historyData.category === 'cdrs') {
+          update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
+          update.total = Math.max(0, (stats.total || 0) - count);
+          await statsRef.update(update);
+        } else if (historyData.category === 'imei') {
+          update.imei = Math.max(0, (stats.imei || 0) - count);
+          update.total = Math.max(0, (stats.total || 0) - count);
+          await statsRef.update(update);
+        } else {
+          // For other categories, don't update stats
+          console.log('Category not counted in stats, skipping stats update:', historyData.category);
+        }
       }
-      // For other categories, don't update stats
-      
-      await statsRef.update(update);
+    } catch (statsError) {
+      console.error('Error updating stats during delete:', statsError);
+      // Continue with deletion even if stats update fails
     }
 
     await historyRef.delete();
-
     console.log('History entry deleted successfully');
+
     res.json({ success: true, message: 'History entry deleted' });
   } catch (error) {
-    console.error('Delete history error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('💥 Delete history error:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      details: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
