@@ -93,6 +93,30 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ==================== ADMIN AUTH MIDDLEWARE ====================
+const authenticateAdmin = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Admin token required' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    // Check if this is admin user
+    if (decoded.email !== process.env.ADMIN_EMAIL) {
+      return res.status(403).json({ error: 'Not authorized as admin' });
+    }
+    
+    req.admin = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: 'Invalid admin token' });
+  }
+};
+
 // ==================== ROUTES ====================
 
 // Health check
@@ -158,6 +182,13 @@ app.post('/api/login', async (req, res) => {
 
     console.log('Password verified successfully');
 
+    // Check if user is blocked
+    const userDoc = await db.collection('users').doc(userRecord.uid).get();
+    if (userDoc.exists && userDoc.data().status === 'blocked') {
+      console.log('User is blocked:', email);
+      return res.status(403).json({ error: 'Your account has been suspended. Please contact administrator.' });
+    }
+
     // Generate JWT token
     const token = jwt.sign(
       { 
@@ -176,10 +207,10 @@ app.post('/api/login', async (req, res) => {
     let userData = {};
     
     try {
-      const userDoc = await db.collection('users').doc(userRecord.uid).get();
+      const userDocData = await db.collection('users').doc(userRecord.uid).get();
       
-      if (userDoc.exists) {
-        userData = userDoc.data();
+      if (userDocData.exists) {
+        userData = userDocData.data();
         console.log('User data found in Firestore');
       } else {
         // Create default user data
@@ -197,9 +228,9 @@ app.post('/api/login', async (req, res) => {
             ioNo: '0300-9793362',
             divisionRo: 'SAHIWAL',
             divRef: '3097',
-            divDate: '30/11/2025',
-            refDate: '30/11/2025'
-          }
+            divDate: '30/11/2025'
+          },
+          status: 'active'
         };
         await db.collection('users').doc(userRecord.uid).set(defaultData);
         userData = defaultData;
@@ -496,8 +527,8 @@ app.post('/api/verify-token', authenticateToken, (req, res) => {
   });
 });
 
-// ==================== 9. ADMIN: CREATE USER (Manual) ====================
-app.post('/api/admin/create-user', async (req, res) => {
+// ==================== 9. ADMIN: CREATE USER ====================
+app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
@@ -515,6 +546,7 @@ app.post('/api/admin/create-user', async (req, res) => {
 
     // Create default user data
     await db.collection('users').doc(userRecord.uid).set({
+      status: 'active',
       settings: {
         refNo: '1/DO CCD',
         centerDo: 'PAKPATTAN',
@@ -545,7 +577,7 @@ app.post('/api/admin/create-user', async (req, res) => {
 });
 
 // ==================== 10. ADMIN: DELETE USER ====================
-app.post('/api/admin/delete-user', async (req, res) => {
+app.post('/api/admin/delete-user', authenticateAdmin, async (req, res) => {
   try {
     const { email, adminSecret } = req.body;
     
@@ -581,6 +613,164 @@ app.post('/api/admin/delete-user', async (req, res) => {
     res.json({ success: true, message: 'User deleted completely' });
   } catch (error) {
     console.error('Delete user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== 11. ADMIN: VERIFY TOKEN ====================
+app.post('/api/admin/verify', authenticateAdmin, (req, res) => {
+  console.log('Admin token verified for:', req.admin.email);
+  res.json({ valid: true, admin: req.admin });
+});
+
+// ==================== 12. ADMIN: LOGIN ====================
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    const adminEmail = process.env.ADMIN_EMAIL;
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    
+    if (!adminEmail || !adminPassword) {
+      console.error('Admin credentials not set in environment');
+      return res.status(500).json({ error: 'Admin configuration error' });
+    }
+    
+    if (email !== adminEmail || password !== adminPassword) {
+      return res.status(401).json({ error: 'Invalid admin credentials' });
+    }
+    
+    // Generate admin token
+    const token = jwt.sign(
+      { email: adminEmail, role: 'admin' },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    
+    console.log('Admin logged in:', adminEmail);
+    res.json({ 
+      success: true, 
+      token, 
+      admin: { email: adminEmail } 
+    });
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== 13. ADMIN: GET ALL USERS WITH STATS ====================
+app.get('/api/admin/all-users', authenticateAdmin, async (req, res) => {
+  try {
+    // Get all users from Firebase Auth
+    const listUsersResult = await admin.auth().listUsers(1000);
+    const users = listUsersResult.users;
+    
+    const usersData = [];
+    
+    for (const user of users) {
+      // Get user data from Firestore
+      const userDoc = await db.collection('users').doc(user.uid).get();
+      const userSettings = userDoc.exists ? userDoc.data() : {};
+      
+      // Get stats
+      const statsDoc = await db.collection('stats').doc(user.uid).get();
+      const stats = statsDoc.exists ? statsDoc.data() : { cdrs: 0, imei: 0, total: 0 };
+      
+      // Get user status (blocked or not)
+      const status = userSettings.status || 'active';
+      
+      usersData.push({
+        uid: user.uid,
+        email: user.email,
+        createdAt: user.metadata.creationTime,
+        lastLogin: user.metadata.lastSignInTime,
+        status: status,
+        stats: {
+          cdrs: stats.cdrs || 0,
+          imei: stats.imei || 0,
+          total: stats.total || 0
+        },
+        settings: userSettings.settings || {}
+      });
+    }
+    
+    console.log(`Fetched ${usersData.length} users for admin`);
+    res.json({ users: usersData });
+  } catch (error) {
+    console.error('Get all users error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== 14. ADMIN: BLOCK USER ====================
+app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
+  try {
+    const { uid } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+    
+    // Update user status to blocked
+    await db.collection('users').doc(uid).set({
+      status: 'blocked',
+      blockedAt: admin.firestore.FieldValue.serverTimestamp(),
+      blockedBy: req.admin.email
+    }, { merge: true });
+    
+    // Also disable user in Firebase Auth
+    await admin.auth().updateUser(uid, { disabled: true });
+    
+    console.log(`User ${uid} blocked by admin ${req.admin.email}`);
+    res.json({ success: true, message: 'User blocked successfully' });
+  } catch (error) {
+    console.error('Block user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== 15. ADMIN: UNBLOCK USER ====================
+app.post('/api/admin/unblock-user', authenticateAdmin, async (req, res) => {
+  try {
+    const { uid } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+    
+    // Update user status to active
+    await db.collection('users').doc(uid).set({
+      status: 'active'
+    }, { merge: true });
+    
+    // Enable user in Firebase Auth
+    await admin.auth().updateUser(uid, { disabled: false });
+    
+    console.log(`User ${uid} unblocked by admin ${req.admin.email}`);
+    res.json({ success: true, message: 'User unblocked successfully' });
+  } catch (error) {
+    console.error('Unblock user error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== 16. ADMIN: FORCE LOGOUT USER ====================
+app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
+  try {
+    const { uid } = req.body;
+    
+    if (!uid) {
+      return res.status(400).json({ error: 'User ID required' });
+    }
+    
+    // Revoke all refresh tokens for this user
+    await admin.auth().revokeRefreshTokens(uid);
+    
+    console.log(`User ${uid} force logged out by admin ${req.admin.email}`);
+    res.json({ success: true, message: 'User logged out successfully' });
+  } catch (error) {
+    console.error('Force logout error:', error);
     res.status(500).json({ error: error.message });
   }
 });
