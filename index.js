@@ -1,5 +1,5 @@
 // index.js - Complete Backend for Suspect Tracker
-// Deploy on Vercel - With Domain Lock & Token Blacklisting
+// Deploy on Vercel - With Token Blacklisting & Immediate Logout
 
 const express = require('express');
 const cors = require('cors');
@@ -13,8 +13,10 @@ require('dotenv').config();
 let firebaseInitialized = false;
 let db = null;
 
-// Token blacklist cache
+// Token blacklist - Store in memory (for Vercel, consider Redis for production)
+// This will reset on cold starts, but works for immediate logout
 const tokenBlacklist = new Set();
+const userActiveTokens = new Map(); // Store active tokens per user
 
 try {
   console.log('🔥 Starting Firebase Admin initialization...');
@@ -63,12 +65,10 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function(origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
-    
     if (allowedOrigins.indexOf(origin) === -1) {
       console.log(`❌ CORS Blocked request from: ${origin}`);
-      return callback(new Error('Access denied. This API can only be accessed from https://suspect-tracker.free.nf'), false);
+      return callback(new Error('Access denied'), false);
     }
     return callback(null, true);
   },
@@ -79,26 +79,20 @@ app.use(cors({
 // Domain check middleware
 app.use((req, res, next) => {
   const referer = req.headers.referer || req.headers.origin;
-  
   if (referer && !referer.includes('suspect-tracker.free.nf') && 
       !referer.includes('localhost') && !referer.includes('127.0.0.1')) {
-    console.log(`❌ Domain Blocked request with referer: ${referer}`);
-    return res.status(403).json({ 
-      error: 'Access Denied', 
-      message: 'This API can only be accessed from https://suspect-tracker.free.nf' 
-    });
+    return res.status(403).json({ error: 'Access Denied' });
   }
-  
   next();
 });
 
 // Log all requests
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || 'unknown'}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
   next();
 });
 
-// ==================== AUTH MIDDLEWARE ====================
+// ==================== AUTH MIDDLEWARE with Blacklist Check ====================
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -107,8 +101,9 @@ const authenticateToken = async (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
+  // Check if token is blacklisted
   if (tokenBlacklist.has(token)) {
-    console.log('Token is blacklisted, rejecting request');
+    console.log('🚫 Token is blacklisted, rejecting request');
     return res.status(403).json({ error: 'Token has been revoked. Please login again.' });
   }
 
@@ -117,6 +112,7 @@ const authenticateToken = async (req, res, next) => {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     
+    // Check if user is blocked in Firestore
     try {
       const userDoc = await db.collection('users').doc(user.uid).get();
       if (userDoc.exists && userDoc.data().status === 'blocked') {
@@ -142,11 +138,9 @@ const authenticateAdmin = async (req, res, next) => {
   
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    
     if (decoded.email !== process.env.ADMIN_EMAIL) {
       return res.status(403).json({ error: 'Not authorized as admin' });
     }
-    
     req.admin = decoded;
     next();
   } catch (err) {
@@ -206,19 +200,17 @@ app.post('/api/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { uid: userRecord.uid, email: userRecord.email, verified: true, iat: Date.now() },
+      { uid: userRecord.uid, email: userRecord.email, verified: true },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    for (const blacklistedToken of tokenBlacklist) {
-      try {
-        const decoded = jwt.decode(blacklistedToken);
-        if (decoded && decoded.uid === userRecord.uid) {
-          tokenBlacklist.delete(blacklistedToken);
-        }
-      } catch(e) {}
+    // Clean up old blacklisted tokens for this user
+    if (userActiveTokens.has(userRecord.uid)) {
+      const oldTokens = userActiveTokens.get(userRecord.uid);
+      oldTokens.forEach(oldToken => tokenBlacklist.delete(oldToken));
     }
+    userActiveTokens.set(userRecord.uid, new Set([token]));
 
     let userData = {};
     try {
@@ -422,7 +414,6 @@ app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
     const { email, password, adminSecret } = req.body;
     
     if (adminSecret !== process.env.ADMIN_SECRET_KEY) {
-      console.log('Admin create user: unauthorized - invalid secret');
       return res.status(403).json({ error: 'Unauthorized: Invalid admin secret key' });
     }
 
@@ -566,18 +557,32 @@ app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
     
     console.log(`🔨 Admin blocking user: ${uid}`);
     
+    // Update user status to blocked
     await db.collection('users').doc(uid).set({
       status: 'blocked',
       blockedAt: admin.firestore.FieldValue.serverTimestamp(),
       blockedBy: req.admin.email
     }, { merge: true });
     
+    // Disable user in Firebase Auth
     await admin.auth().updateUser(uid, { disabled: true });
+    
+    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    console.log(`✅ User ${uid} blocked successfully`);
+    // BLACKLIST ALL ACTIVE TOKENS FOR THIS USER (IMMEDIATE LOGOUT)
+    if (userActiveTokens.has(uid)) {
+      const userTokens = userActiveTokens.get(uid);
+      userTokens.forEach(token => {
+        tokenBlacklist.add(token);
+        console.log(`🚫 Blacklisted token for user: ${uid}`);
+      });
+      userActiveTokens.delete(uid);
+    }
     
-    res.json({ success: true, message: 'User blocked successfully' });
+    console.log(`✅ User ${uid} blocked and tokens blacklisted. User will be logged out immediately.`);
+    
+    res.json({ success: true, message: 'User blocked successfully. User will be logged out immediately.' });
   } catch (error) {
     console.error('Block user error:', error);
     res.status(500).json({ error: error.message });
@@ -602,16 +607,30 @@ app.post('/api/admin/unblock-user', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ==================== 16. ADMIN: FORCE LOGOUT USER ====================
+// ==================== 16. ADMIN: FORCE LOGOUT USER (IMMEDIATE) ====================
 app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
   try {
     const { uid } = req.body;
     if (!uid) return res.status(400).json({ error: 'User ID required' });
     
     console.log(`🚪 Admin force logging out user: ${uid}`);
+    
+    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    res.json({ success: true, message: 'User logged out successfully' });
+    // BLACKLIST ALL ACTIVE TOKENS FOR THIS USER (IMMEDIATE LOGOUT)
+    if (userActiveTokens.has(uid)) {
+      const userTokens = userActiveTokens.get(uid);
+      userTokens.forEach(token => {
+        tokenBlacklist.add(token);
+        console.log(`🚫 Blacklisted token for user: ${uid}`);
+      });
+      userActiveTokens.delete(uid);
+    }
+    
+    console.log(`✅ User ${uid} force logged out. All tokens blacklisted.`);
+    
+    res.json({ success: true, message: 'User logged out successfully. All sessions terminated immediately.' });
   } catch (error) {
     console.error('Force logout error:', error);
     res.status(500).json({ error: error.message });
