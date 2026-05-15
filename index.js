@@ -1,6 +1,5 @@
 // index.js - Complete Backend for Suspect Tracker
-// Deploy on Vercel, single file, Firebase Admin + Express
-// UPDATED: ADMIN_SECRET_KEY instead of ADMIN_SECRET
+// Deploy on Vercel - All routes included
 
 const express = require('express');
 const cors = require('cors');
@@ -16,16 +15,11 @@ let db = null;
 
 try {
   console.log('🔥 Starting Firebase Admin initialization...');
-  console.log('Project ID exists:', !!process.env.FIREBASE_PROJECT_ID);
-  console.log('Private Key exists:', !!process.env.FIREBASE_PRIVATE_KEY);
-  console.log('Client Email exists:', !!process.env.FIREBASE_CLIENT_EMAIL);
 
   if (!admin.apps.length) {
-    // Format private key correctly
     let privateKey = process.env.FIREBASE_PRIVATE_KEY;
     if (privateKey) {
       privateKey = privateKey.replace(/\\n/g, '\n');
-      console.log('Private key formatted, length:', privateKey.length);
     }
 
     const credential = {
@@ -33,8 +27,6 @@ try {
       privateKey: privateKey,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
     };
-
-    console.log('Credential object created');
 
     admin.initializeApp({
       credential: admin.credential.cert(credential),
@@ -46,16 +38,10 @@ try {
   }
 } catch (error) {
   console.error('❌ Firebase Admin init error:', error);
-  console.error('Error details:', {
-    message: error.message,
-    code: error.code,
-    stack: error.stack
-  });
 }
 
 // ==================== EXPRESS SETUP ====================
 const app = express();
-const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_change_me';
 
 // Middleware
@@ -63,9 +49,9 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || 'http://localhost:5500',
+    origin: '*', // Allow all origins for testing
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   })
 );
 
@@ -93,7 +79,6 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-// ==================== ADMIN AUTH MIDDLEWARE ====================
 const authenticateAdmin = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -129,34 +114,22 @@ app.get('/', (req, res) => {
 
 // ==================== 1. LOGIN ====================
 app.post('/api/login', async (req, res) => {
-  console.log('📝 Login endpoint hit');
-  
   try {
     const { email, password } = req.body;
-    console.log('Email:', email);
-    console.log('Password provided:', !!password);
 
     if (!email || !password) {
-      console.log('Missing email or password');
       return res.status(400).json({ error: 'Email and password required' });
     }
 
-    console.log('Checking Firebase Auth for user...');
     let userRecord;
     try {
       userRecord = await admin.auth().getUserByEmail(email);
-      console.log('User found in Firebase Auth:', userRecord.uid);
     } catch (authError) {
-      console.error('Firebase Auth error:', authError);
       return res.status(401).json({ error: 'User not found' });
     }
 
-    console.log('Verifying password with Firebase REST API...');
     const apiKey = process.env.FIREBASE_API_KEY;
-    console.log('API Key exists:', !!apiKey);
-    
     if (!apiKey) {
-      console.error('FIREBASE_API_KEY missing in environment');
       return res.status(500).json({ error: 'Firebase API key missing' });
     }
 
@@ -169,45 +142,28 @@ app.post('/api/login', async (req, res) => {
       }
     );
 
-    const verifyData = await verifyResponse.json();
-    console.log('Firebase REST API response status:', verifyResponse.status);
-
     if (!verifyResponse.ok) {
-      console.error('Password verification failed:', verifyData.error);
+      const verifyData = await verifyResponse.json();
       return res.status(401).json({ error: verifyData.error?.message || 'Invalid password' });
     }
 
-    console.log('Password verified successfully');
-
     const userDoc = await db.collection('users').doc(userRecord.uid).get();
     if (userDoc.exists && userDoc.data().status === 'blocked') {
-      console.log('User is blocked:', email);
-      return res.status(403).json({ error: 'Your account has been suspended. Please contact administrator.' });
+      return res.status(403).json({ error: 'Your account has been suspended.' });
     }
 
     const token = jwt.sign(
-      { 
-        uid: userRecord.uid, 
-        email: userRecord.email,
-        verified: true 
-      },
+      { uid: userRecord.uid, email: userRecord.email, verified: true },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    console.log('JWT token generated');
-
-    console.log('Fetching user data from Firestore...');
     let userData = {};
-    
     try {
       const userDocData = await db.collection('users').doc(userRecord.uid).get();
-      
       if (userDocData.exists) {
         userData = userDocData.data();
-        console.log('User data found in Firestore');
       } else {
-        console.log('Creating default user data');
         const defaultData = {
           settings: {
             refNo: '1/DO CCD',
@@ -227,14 +183,11 @@ app.post('/api/login', async (req, res) => {
         };
         await db.collection('users').doc(userRecord.uid).set(defaultData);
         userData = defaultData;
-        console.log('Default user data created');
       }
     } catch (firestoreError) {
-      console.error('Firestore error:', firestoreError);
       userData = { settings: {} };
     }
 
-    console.log('Login successful for:', email);
     res.json({
       token,
       user: {
@@ -245,13 +198,8 @@ app.post('/api/login', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('💥 Login error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -259,16 +207,12 @@ app.post('/api/login', async (req, res) => {
 app.get('/api/user-data', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    console.log('Fetching user data for uid:', uid);
-    
     const userDoc = await db.collection('users').doc(uid).get();
 
     if (!userDoc.exists) {
-      console.log('User data not found');
       return res.status(404).json({ error: 'User data not found' });
     }
 
-    console.log('User data fetched successfully');
     res.json(userDoc.data());
   } catch (error) {
     console.error('Get user data error:', error);
@@ -286,12 +230,7 @@ app.post('/api/save-settings', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Settings required' });
     }
 
-    console.log('Saving settings for uid:', uid);
-    await db.collection('users').doc(uid).set({
-      settings: settings
-    }, { merge: true });
-
-    console.log('Settings saved successfully');
+    await db.collection('users').doc(uid).set({ settings: settings }, { merge: true });
     res.json({ success: true, message: 'Settings saved successfully' });
   } catch (error) {
     console.error('Save settings error:', error);
@@ -309,7 +248,6 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Category and outputData required' });
     }
 
-    console.log('Saving output to history for uid:', uid);
     const historyEntry = {
       userId: uid,
       category,
@@ -326,7 +264,6 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
 
     const statsRef = db.collection('stats').doc(uid);
     const statsDoc = await statsRef.get();
-    
     const count = Array.isArray(numbers) ? numbers.length : 1;
     
     if (!statsDoc.exists) {
@@ -338,7 +275,6 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
     } else {
       const stats = statsDoc.data();
       const update = {};
-      
       if (category === 'cdrs') {
         update.cdrs = (stats.cdrs || 0) + count;
         update.total = (stats.total || 0) + count;
@@ -347,17 +283,10 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
         update.imei = (stats.imei || 0) + count;
         update.total = (stats.total || 0) + count;
         await statsRef.update(update);
-      } else {
-        console.log('Category not counted in stats:', category);
       }
     }
 
-    console.log('Output saved to history with id:', docRef.id);
-    res.json({ 
-      success: true, 
-      id: docRef.id,
-      message: 'Output saved to history' 
-    });
+    res.json({ success: true, id: docRef.id, message: 'Output saved to history' });
   } catch (error) {
     console.error('Save output error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -370,13 +299,6 @@ app.get('/api/history', authenticateToken, async (req, res) => {
     const uid = req.user.uid;
     const { category, limit = 50 } = req.query;
 
-    console.log('Fetching history for uid:', uid, 'category:', category);
-
-    if (!db) {
-      console.error('Firestore not initialized');
-      return res.status(500).json({ error: 'Database not initialized' });
-    }
-
     let query = db.collection('history')
       .where('userId', '==', uid)
       .orderBy('createdAt', 'desc')
@@ -387,7 +309,6 @@ app.get('/api/history', authenticateToken, async (req, res) => {
     }
 
     const snapshot = await query.get();
-    
     const history = [];
     snapshot.forEach(doc => {
       const data = doc.data();
@@ -398,16 +319,10 @@ app.get('/api/history', authenticateToken, async (req, res) => {
       });
     });
 
-    console.log('Found', history.length, 'history entries');
     res.json(history);
   } catch (error) {
-    console.error('💥 Get history error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    console.error('Get history error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -415,18 +330,13 @@ app.get('/api/history', authenticateToken, async (req, res) => {
 app.get('/api/stats', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
-    console.log('Fetching stats for uid:', uid);
-    
     const statsDoc = await db.collection('stats').doc(uid).get();
 
     if (!statsDoc.exists) {
-      console.log('No stats found, returning zeros');
       return res.json({ cdrs: 0, imei: 0, total: 0 });
     }
 
     const stats = statsDoc.data();
-    console.log('Stats found:', stats);
-    
     res.json({
       cdrs: stats.cdrs || 0,
       imei: stats.imei || 0,
@@ -443,8 +353,6 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
   try {
     const uid = req.user.uid;
     const historyId = req.params.id;
-
-    console.log('Deleting history entry:', historyId, 'for uid:', uid);
 
     const historyRef = db.collection('history').doc(historyId);
     const historyDoc = await historyRef.get();
@@ -475,8 +383,6 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
           update.imei = Math.max(0, (stats.imei || 0) - count);
           update.total = Math.max(0, (stats.total || 0) - count);
           await statsRef.update(update);
-        } else {
-          console.log('Category not counted in stats, skipping stats update:', historyData.category);
         }
       }
     } catch (statsError) {
@@ -484,30 +390,16 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
     }
 
     await historyRef.delete();
-    console.log('History entry deleted successfully');
-
     res.json({ success: true, message: 'History entry deleted' });
   } catch (error) {
-    console.error('💥 Delete history error:', error);
-    console.error('Error stack:', error.stack);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      details: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    console.error('Delete history error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // ==================== 8. VERIFY TOKEN ====================
 app.post('/api/verify-token', authenticateToken, (req, res) => {
-  console.log('Token verified for uid:', req.user.uid);
-  res.json({ 
-    valid: true, 
-    user: {
-      uid: req.user.uid,
-      email: req.user.email
-    }
-  });
+  res.json({ valid: true, user: { uid: req.user.uid, email: req.user.email } });
 });
 
 // ==================== 9. ADMIN: CREATE USER ====================
@@ -515,18 +407,15 @@ app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
-    // USING ADMIN_SECRET_KEY (changed from ADMIN_SECRET)
+    // USING ADMIN_SECRET_KEY
     if (adminSecret !== process.env.ADMIN_SECRET_KEY) {
-      console.log('Admin create user: unauthorized attempt');
-      return res.status(403).json({ error: 'Unauthorized' });
+      console.log('Admin create user: unauthorized - invalid secret');
+      return res.status(403).json({ error: 'Unauthorized: Invalid admin secret key' });
     }
 
     console.log('Creating new user:', email);
 
-    const userRecord = await admin.auth().createUser({
-      email,
-      password,
-    });
+    const userRecord = await admin.auth().createUser({ email, password });
 
     await db.collection('users').doc(userRecord.uid).set({
       status: 'active',
@@ -548,11 +437,7 @@ app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
     });
 
     console.log('User created successfully:', userRecord.uid);
-    res.json({ 
-      success: true, 
-      uid: userRecord.uid,
-      message: 'User created successfully' 
-    });
+    res.json({ success: true, uid: userRecord.uid, message: 'User created successfully' });
   } catch (error) {
     console.error('Create user error:', error);
     res.status(500).json({ error: error.message });
@@ -564,10 +449,10 @@ app.post('/api/admin/delete-user', authenticateAdmin, async (req, res) => {
   try {
     const { email, adminSecret } = req.body;
     
-    // USING ADMIN_SECRET_KEY (changed from ADMIN_SECRET)
+    // USING ADMIN_SECRET_KEY
     if (adminSecret !== process.env.ADMIN_SECRET_KEY) {
-      console.log('Admin delete user: unauthorized attempt');
-      return res.status(403).json({ error: 'Unauthorized' });
+      console.log('Admin delete user: unauthorized - invalid secret');
+      return res.status(403).json({ error: 'Unauthorized: Invalid admin secret key' });
     }
 
     console.log('Deleting user:', email);
@@ -581,9 +466,7 @@ app.post('/api/admin/delete-user', authenticateAdmin, async (req, res) => {
       .get();
     
     const batch = db.batch();
-    historySnapshot.docs.forEach(doc => {
-      batch.delete(doc.ref);
-    });
+    historySnapshot.docs.forEach(doc => batch.delete(doc.ref));
     await batch.commit();
 
     await admin.auth().deleteUser(userRecord.uid);
@@ -598,7 +481,6 @@ app.post('/api/admin/delete-user', authenticateAdmin, async (req, res) => {
 
 // ==================== 11. ADMIN: VERIFY TOKEN ====================
 app.post('/api/admin/verify', authenticateAdmin, (req, res) => {
-  console.log('Admin token verified for:', req.admin.email);
   res.json({ valid: true, admin: req.admin });
 });
 
@@ -611,7 +493,6 @@ app.post('/api/admin/login', async (req, res) => {
     const adminPassword = process.env.ADMIN_PASSWORD;
     
     if (!adminEmail || !adminPassword) {
-      console.error('Admin credentials not set in environment');
       return res.status(500).json({ error: 'Admin configuration error' });
     }
     
@@ -625,12 +506,7 @@ app.post('/api/admin/login', async (req, res) => {
       { expiresIn: '1d' }
     );
     
-    console.log('Admin logged in:', adminEmail);
-    res.json({ 
-      success: true, 
-      token, 
-      admin: { email: adminEmail } 
-    });
+    res.json({ success: true, token, admin: { email: adminEmail } });
   } catch (error) {
     console.error('Admin login error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -642,16 +518,13 @@ app.get('/api/admin/all-users', authenticateAdmin, async (req, res) => {
   try {
     const listUsersResult = await admin.auth().listUsers(1000);
     const users = listUsersResult.users;
-    
     const usersData = [];
     
     for (const user of users) {
       const userDoc = await db.collection('users').doc(user.uid).get();
       const userSettings = userDoc.exists ? userDoc.data() : {};
-      
       const statsDoc = await db.collection('stats').doc(user.uid).get();
       const stats = statsDoc.exists ? statsDoc.data() : { cdrs: 0, imei: 0, total: 0 };
-      
       const status = userSettings.status || 'active';
       
       usersData.push({
@@ -669,7 +542,6 @@ app.get('/api/admin/all-users', authenticateAdmin, async (req, res) => {
       });
     }
     
-    console.log(`Fetched ${usersData.length} users for admin`);
     res.json({ users: usersData });
   } catch (error) {
     console.error('Get all users error:', error);
@@ -681,10 +553,7 @@ app.get('/api/admin/all-users', authenticateAdmin, async (req, res) => {
 app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
   try {
     const { uid } = req.body;
-    
-    if (!uid) {
-      return res.status(400).json({ error: 'User ID required' });
-    }
+    if (!uid) return res.status(400).json({ error: 'User ID required' });
     
     await db.collection('users').doc(uid).set({
       status: 'blocked',
@@ -693,8 +562,6 @@ app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
     }, { merge: true });
     
     await admin.auth().updateUser(uid, { disabled: true });
-    
-    console.log(`User ${uid} blocked by admin ${req.admin.email}`);
     res.json({ success: true, message: 'User blocked successfully' });
   } catch (error) {
     console.error('Block user error:', error);
@@ -706,18 +573,10 @@ app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
 app.post('/api/admin/unblock-user', authenticateAdmin, async (req, res) => {
   try {
     const { uid } = req.body;
+    if (!uid) return res.status(400).json({ error: 'User ID required' });
     
-    if (!uid) {
-      return res.status(400).json({ error: 'User ID required' });
-    }
-    
-    await db.collection('users').doc(uid).set({
-      status: 'active'
-    }, { merge: true });
-    
+    await db.collection('users').doc(uid).set({ status: 'active' }, { merge: true });
     await admin.auth().updateUser(uid, { disabled: false });
-    
-    console.log(`User ${uid} unblocked by admin ${req.admin.email}`);
     res.json({ success: true, message: 'User unblocked successfully' });
   } catch (error) {
     console.error('Unblock user error:', error);
@@ -729,14 +588,9 @@ app.post('/api/admin/unblock-user', authenticateAdmin, async (req, res) => {
 app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
   try {
     const { uid } = req.body;
-    
-    if (!uid) {
-      return res.status(400).json({ error: 'User ID required' });
-    }
+    if (!uid) return res.status(400).json({ error: 'User ID required' });
     
     await admin.auth().revokeRefreshTokens(uid);
-    
-    console.log(`User ${uid} force logged out by admin ${req.admin.email}`);
     res.json({ success: true, message: 'User logged out successfully' });
   } catch (error) {
     console.error('Force logout error:', error);
@@ -744,12 +598,5 @@ app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ==================== START SERVER ====================
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🔥 Firebase initialized: ${firebaseInitialized}`);
-  console.log(`🔧 Environment: ${process.env.NODE_ENV || 'development'}`);
-});
-
-// Export for Vercel
+// ==================== EXPORT FOR VERCEL ====================
 module.exports = app;
