@@ -1,5 +1,5 @@
 // index.js - Complete Backend for Suspect Tracker
-// Deploy on Vercel - With Token Blacklisting & Immediate Logout
+// Deploy on Vercel - With Domain Lock & Token Blacklisting & Stats Fix
 
 const express = require('express');
 const cors = require('cors');
@@ -13,10 +13,8 @@ require('dotenv').config();
 let firebaseInitialized = false;
 let db = null;
 
-// Token blacklist - Store in memory (for Vercel, consider Redis for production)
-// This will reset on cold starts, but works for immediate logout
+// Token blacklist cache
 const tokenBlacklist = new Set();
-const userActiveTokens = new Map(); // Store active tokens per user
 
 try {
   console.log('🔥 Starting Firebase Admin initialization...');
@@ -65,10 +63,12 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
+    
     if (allowedOrigins.indexOf(origin) === -1) {
       console.log(`❌ CORS Blocked request from: ${origin}`);
-      return callback(new Error('Access denied'), false);
+      return callback(new Error('Access denied. This API can only be accessed from https://suspect-tracker.free.nf'), false);
     }
     return callback(null, true);
   },
@@ -79,20 +79,26 @@ app.use(cors({
 // Domain check middleware
 app.use((req, res, next) => {
   const referer = req.headers.referer || req.headers.origin;
+  
   if (referer && !referer.includes('suspect-tracker.free.nf') && 
       !referer.includes('localhost') && !referer.includes('127.0.0.1')) {
-    return res.status(403).json({ error: 'Access Denied' });
+    console.log(`❌ Domain Blocked request with referer: ${referer}`);
+    return res.status(403).json({ 
+      error: 'Access Denied', 
+      message: 'This API can only be accessed from https://suspect-tracker.free.nf' 
+    });
   }
+  
   next();
 });
 
 // Log all requests
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || 'unknown'}`);
   next();
 });
 
-// ==================== AUTH MIDDLEWARE with Blacklist Check ====================
+// ==================== AUTH MIDDLEWARE ====================
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -101,9 +107,8 @@ const authenticateToken = async (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  // Check if token is blacklisted
   if (tokenBlacklist.has(token)) {
-    console.log('🚫 Token is blacklisted, rejecting request');
+    console.log('Token is blacklisted, rejecting request');
     return res.status(403).json({ error: 'Token has been revoked. Please login again.' });
   }
 
@@ -112,7 +117,6 @@ const authenticateToken = async (req, res, next) => {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     
-    // Check if user is blocked in Firestore
     try {
       const userDoc = await db.collection('users').doc(user.uid).get();
       if (userDoc.exists && userDoc.data().status === 'blocked') {
@@ -138,9 +142,11 @@ const authenticateAdmin = async (req, res, next) => {
   
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    
     if (decoded.email !== process.env.ADMIN_EMAIL) {
       return res.status(403).json({ error: 'Not authorized as admin' });
     }
+    
     req.admin = decoded;
     next();
   } catch (err) {
@@ -200,17 +206,19 @@ app.post('/api/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { uid: userRecord.uid, email: userRecord.email, verified: true },
+      { uid: userRecord.uid, email: userRecord.email, verified: true, iat: Date.now() },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
 
-    // Clean up old blacklisted tokens for this user
-    if (userActiveTokens.has(userRecord.uid)) {
-      const oldTokens = userActiveTokens.get(userRecord.uid);
-      oldTokens.forEach(oldToken => tokenBlacklist.delete(oldToken));
+    for (const blacklistedToken of tokenBlacklist) {
+      try {
+        const decoded = jwt.decode(blacklistedToken);
+        if (decoded && decoded.uid === userRecord.uid) {
+          tokenBlacklist.delete(blacklistedToken);
+        }
+      } catch(e) {}
     }
-    userActiveTokens.set(userRecord.uid, new Set([token]));
 
     let userData = {};
     try {
@@ -315,6 +323,32 @@ app.post('/api/save-output', authenticateToken, async (req, res) => {
     };
 
     const docRef = await db.collection('history').add(historyEntry);
+
+    // Update stats
+    const statsRef = db.collection('stats').doc(uid);
+    const statsDoc = await statsRef.get();
+    const count = Array.isArray(numbers) ? numbers.length : 1;
+    
+    if (!statsDoc.exists) {
+      await statsRef.set({
+        cdrs: category === 'cdrs' ? count : 0,
+        imei: category === 'imei' ? count : 0,
+        total: (category === 'cdrs' || category === 'imei') ? count : 0
+      });
+    } else {
+      const stats = statsDoc.data();
+      const update = {};
+      if (category === 'cdrs') {
+        update.cdrs = (stats.cdrs || 0) + count;
+        update.total = (stats.total || 0) + count;
+        await statsRef.update(update);
+      } else if (category === 'imei') {
+        update.imei = (stats.imei || 0) + count;
+        update.total = (stats.total || 0) + count;
+        await statsRef.update(update);
+      }
+    }
+
     res.json({ success: true, id: docRef.id, message: 'Output saved to history' });
   } catch (error) {
     console.error('Save output error:', error);
@@ -395,6 +429,30 @@ app.delete('/api/history/:id', authenticateToken, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized' });
     }
 
+    // Update stats before deleting
+    try {
+      const statsRef = db.collection('stats').doc(uid);
+      const statsDoc = await statsRef.get();
+      
+      if (statsDoc.exists) {
+        const stats = statsDoc.data();
+        const count = Array.isArray(historyData.numbers) ? historyData.numbers.length : 1;
+        const update = {};
+        
+        if (historyData.category === 'cdrs') {
+          update.cdrs = Math.max(0, (stats.cdrs || 0) - count);
+          update.total = Math.max(0, (stats.total || 0) - count);
+          await statsRef.update(update);
+        } else if (historyData.category === 'imei') {
+          update.imei = Math.max(0, (stats.imei || 0) - count);
+          update.total = Math.max(0, (stats.total || 0) - count);
+          await statsRef.update(update);
+        }
+      }
+    } catch (statsError) {
+      console.error('Error updating stats during delete:', statsError);
+    }
+
     await historyRef.delete();
     res.json({ success: true, message: 'History entry deleted' });
   } catch (error) {
@@ -408,12 +466,13 @@ app.post('/api/verify-token', authenticateToken, (req, res) => {
   res.json({ valid: true, user: { uid: req.user.uid, email: req.user.email } });
 });
 
-// ==================== 9. ADMIN: CREATE USER ====================
+// ==================== 9. ADMIN: CREATE USER (WITH STATS FIX) ====================
 app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
   try {
     const { email, password, adminSecret } = req.body;
     
     if (adminSecret !== process.env.ADMIN_SECRET_KEY) {
+      console.log('Admin create user: unauthorized - invalid secret');
       return res.status(403).json({ error: 'Unauthorized: Invalid admin secret key' });
     }
 
@@ -421,6 +480,7 @@ app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
 
     const userRecord = await admin.auth().createUser({ email, password });
 
+    // Create user settings
     await db.collection('users').doc(userRecord.uid).set({
       status: 'active',
       settings: {
@@ -440,6 +500,14 @@ app.post('/api/admin/create-user', authenticateAdmin, async (req, res) => {
       }
     });
 
+    // ✅ FIX: Create stats document with zero values for new user
+    await db.collection('stats').doc(userRecord.uid).set({
+      cdrs: 0,
+      imei: 0,
+      total: 0
+    });
+
+    console.log('User created successfully with stats:', userRecord.uid);
     res.json({ success: true, uid: userRecord.uid, message: 'User created successfully' });
   } catch (error) {
     console.error('Create user error:', error);
@@ -557,32 +625,18 @@ app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
     
     console.log(`🔨 Admin blocking user: ${uid}`);
     
-    // Update user status to blocked
     await db.collection('users').doc(uid).set({
       status: 'blocked',
       blockedAt: admin.firestore.FieldValue.serverTimestamp(),
       blockedBy: req.admin.email
     }, { merge: true });
     
-    // Disable user in Firebase Auth
     await admin.auth().updateUser(uid, { disabled: true });
-    
-    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    // BLACKLIST ALL ACTIVE TOKENS FOR THIS USER (IMMEDIATE LOGOUT)
-    if (userActiveTokens.has(uid)) {
-      const userTokens = userActiveTokens.get(uid);
-      userTokens.forEach(token => {
-        tokenBlacklist.add(token);
-        console.log(`🚫 Blacklisted token for user: ${uid}`);
-      });
-      userActiveTokens.delete(uid);
-    }
+    console.log(`✅ User ${uid} blocked successfully`);
     
-    console.log(`✅ User ${uid} blocked and tokens blacklisted. User will be logged out immediately.`);
-    
-    res.json({ success: true, message: 'User blocked successfully. User will be logged out immediately.' });
+    res.json({ success: true, message: 'User blocked successfully' });
   } catch (error) {
     console.error('Block user error:', error);
     res.status(500).json({ error: error.message });
@@ -607,30 +661,16 @@ app.post('/api/admin/unblock-user', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ==================== 16. ADMIN: FORCE LOGOUT USER (IMMEDIATE) ====================
+// ==================== 16. ADMIN: FORCE LOGOUT USER ====================
 app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
   try {
     const { uid } = req.body;
     if (!uid) return res.status(400).json({ error: 'User ID required' });
     
     console.log(`🚪 Admin force logging out user: ${uid}`);
-    
-    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    // BLACKLIST ALL ACTIVE TOKENS FOR THIS USER (IMMEDIATE LOGOUT)
-    if (userActiveTokens.has(uid)) {
-      const userTokens = userActiveTokens.get(uid);
-      userTokens.forEach(token => {
-        tokenBlacklist.add(token);
-        console.log(`🚫 Blacklisted token for user: ${uid}`);
-      });
-      userActiveTokens.delete(uid);
-    }
-    
-    console.log(`✅ User ${uid} force logged out. All tokens blacklisted.`);
-    
-    res.json({ success: true, message: 'User logged out successfully. All sessions terminated immediately.' });
+    res.json({ success: true, message: 'User logged out successfully' });
   } catch (error) {
     console.error('Force logout error:', error);
     res.status(500).json({ error: error.message });
