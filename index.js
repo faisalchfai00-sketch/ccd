@@ -1,5 +1,5 @@
 // index.js - Complete Backend for Suspect Tracker
-// Deploy on Vercel - With Token Blacklisting
+// Deploy on Vercel - With Domain Lock & Token Blacklisting
 
 const express = require('express');
 const cors = require('cors');
@@ -13,8 +13,7 @@ require('dotenv').config();
 let firebaseInitialized = false;
 let db = null;
 
-// Token blacklist cache (in-memory - will reset on Vercel cold start)
-// For production, use Redis or Firestore
+// Token blacklist cache
 const tokenBlacklist = new Set();
 
 try {
@@ -51,21 +50,55 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_change_me';
 // Middleware
 app.use(express.json());
 app.use(cookieParser());
-app.use(
-  cors({
-    origin: '*',
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  })
-);
 
-// Log all requests
+// ==================== CORS WITH DOMAIN LOCK ====================
+const allowedOrigins = [
+  'https://suspect-tracker.free.nf',
+  'http://suspect-tracker.free.nf',
+  'https://www.suspect-tracker.free.nf',
+  'http://localhost:5500',
+  'http://localhost:5000',
+  'http://127.0.0.1:5500'
+];
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.indexOf(origin) === -1) {
+      console.log(`❌ CORS Blocked request from: ${origin}`);
+      return callback(new Error('Access denied. This API can only be accessed from https://suspect-tracker.free.nf'), false);
+    }
+    return callback(null, true);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+}));
+
+// Domain check middleware
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  const referer = req.headers.referer || req.headers.origin;
+  
+  if (referer && !referer.includes('suspect-tracker.free.nf') && 
+      !referer.includes('localhost') && !referer.includes('127.0.0.1')) {
+    console.log(`❌ Domain Blocked request with referer: ${referer}`);
+    return res.status(403).json({ 
+      error: 'Access Denied', 
+      message: 'This API can only be accessed from https://suspect-tracker.free.nf' 
+    });
+  }
+  
   next();
 });
 
-// ==================== AUTH MIDDLEWARE with Blacklist Check ====================
+// Log all requests
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || 'unknown'}`);
+  next();
+});
+
+// ==================== AUTH MIDDLEWARE ====================
 const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -74,7 +107,6 @@ const authenticateToken = async (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  // Check if token is blacklisted
   if (tokenBlacklist.has(token)) {
     console.log('Token is blacklisted, rejecting request');
     return res.status(403).json({ error: 'Token has been revoked. Please login again.' });
@@ -85,11 +117,9 @@ const authenticateToken = async (req, res, next) => {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
     
-    // Additional check: verify user is not blocked in Firestore
     try {
       const userDoc = await db.collection('users').doc(user.uid).get();
       if (userDoc.exists && userDoc.data().status === 'blocked') {
-        // Blacklist this token
         tokenBlacklist.add(token);
         return res.status(403).json({ error: 'User account has been blocked' });
       }
@@ -181,7 +211,6 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    // Remove any old blacklisted tokens for this user (cleanup)
     for (const blacklistedToken of tokenBlacklist) {
       try {
         const decoded = jwt.decode(blacklistedToken);
@@ -493,7 +522,7 @@ app.post('/api/admin/login', async (req, res) => {
   }
 });
 
-// ==================== 13. ADMIN: GET ALL USERS WITH STATS ====================
+// ==================== 13. ADMIN: GET ALL USERS ====================
 app.get('/api/admin/all-users', authenticateAdmin, async (req, res) => {
   try {
     const listUsersResult = await admin.auth().listUsers(1000);
@@ -537,24 +566,18 @@ app.post('/api/admin/block-user', authenticateAdmin, async (req, res) => {
     
     console.log(`🔨 Admin blocking user: ${uid}`);
     
-    // Update user status to blocked in Firestore
     await db.collection('users').doc(uid).set({
       status: 'blocked',
       blockedAt: admin.firestore.FieldValue.serverTimestamp(),
       blockedBy: req.admin.email
     }, { merge: true });
     
-    // Disable user in Firebase Auth
     await admin.auth().updateUser(uid, { disabled: true });
-    
-    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    // Blacklist all existing tokens for this user (cleanup)
-    // Note: In production, store tokens in Redis/Firestore
-    console.log(`✅ User ${uid} blocked successfully. Tokens will be invalidated.`);
+    console.log(`✅ User ${uid} blocked successfully`);
     
-    res.json({ success: true, message: 'User blocked successfully. User will be logged out immediately.' });
+    res.json({ success: true, message: 'User blocked successfully' });
   } catch (error) {
     console.error('Block user error:', error);
     res.status(500).json({ error: error.message });
@@ -586,11 +609,9 @@ app.post('/api/admin/logout-user', authenticateAdmin, async (req, res) => {
     if (!uid) return res.status(400).json({ error: 'User ID required' });
     
     console.log(`🚪 Admin force logging out user: ${uid}`);
-    
-    // Revoke all refresh tokens
     await admin.auth().revokeRefreshTokens(uid);
     
-    res.json({ success: true, message: 'User logged out successfully. All sessions terminated.' });
+    res.json({ success: true, message: 'User logged out successfully' });
   } catch (error) {
     console.error('Force logout error:', error);
     res.status(500).json({ error: error.message });
